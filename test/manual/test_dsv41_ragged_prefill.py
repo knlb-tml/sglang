@@ -48,7 +48,11 @@ def rectangular_gather(cache, page_table, ratio, page_size):
         .clamp_min(0)
         .int()
     )
-    bases, swa = cache._workspace_bases(width)
+    bases = (
+        torch.arange(cache.num_reqs, dtype=torch.int32, device=page_table.device)
+        * width
+    )
+    swa = cache.num_reqs * width + cache.swa_offsets[:-1]
     return CompressedGather(slots, bases, swa)
 
 

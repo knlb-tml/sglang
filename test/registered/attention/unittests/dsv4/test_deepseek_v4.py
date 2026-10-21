@@ -807,6 +807,33 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     (2, expected_extent),
                 )
 
+    def test_sparse_prefill_c128_gather_packs_request_lengths(self):
+        """A short request next to a long one must not reserve the long one's
+        c128 extent; each region is its own length, with one slot as the floor."""
+        from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
+
+        cache = self._make_sparse_prefill_cache(1024)
+        cache.seq_lens = torch.tensor([1024, 127], dtype=torch.int32)
+        cache.seq_lens_cpu = [1024, 127]
+        cache.swa_offsets = torch.tensor([0, 8, 12], dtype=torch.int32)
+        page_indices = torch.full((2, 64), -1, dtype=torch.int32)
+        page_indices[0, :8] = torch.arange(20, 28, dtype=torch.int32)
+        page_indices[1, :1] = 40
+        combined = (
+            torch.empty((2, 256), dtype=torch.int32),
+            torch.empty(2, dtype=torch.int32),
+        )
+        with mock.patch.object(
+            sparse_prefill_utils, "combine_topk_swa_indices", return_value=combined
+        ) as combine:
+            gather = cache.ensure_c128(page_indices)
+
+        self.assertEqual(gather.flat_token_ids.tolist(), list(range(20, 28)) + [40])
+        self.assertEqual(gather.compressed_base.tolist(), [0, 8])
+        self.assertEqual(gather.swa_base.tolist(), [9, 17])
+        self.assertEqual(combine.call_args.kwargs["topk"], 1024 // 128)
+        self.assertIs(cache.ensure_c128(page_indices), gather)
+
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """SWA writes must translate live locations for idle or missing/mismatched caches.

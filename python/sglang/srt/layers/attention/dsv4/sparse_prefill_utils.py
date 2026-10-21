@@ -252,15 +252,31 @@ class SparsePrefillChunkCache:
         )
         return cache
 
-    def _workspace_bases(self, c_max: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Flat workspace offsets of each request's compressed and SWA regions:
-        ``c_max`` compressed slots per request, then the SWA gather."""
+    def _compressed_lengths_cpu(self, compress_ratio: int) -> list[int]:
+        seq_lens_cpu = self.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self.seq_lens.tolist()
+        return [int(length) // compress_ratio for length in seq_lens_cpu]
+
+    def _packed_layout(
+        self, lengths_cpu: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compressed regions laid end to end ahead of the SWA gather, each as
+        long as its own request; returns the per-request bases, then the request
+        and request-local position of every packed slot."""
         device = self.seq_lens.device
-        compressed_base = (
-            torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c_max
-        ).to(torch.int32)
-        swa_base = (self.num_reqs * c_max + self.swa_offsets[:-1]).to(torch.int32)
-        return compressed_base, swa_base
+        total = sum(lengths_cpu)
+        lengths = async_h2d(lengths_cpu, dtype=torch.int32, device=device)
+        ends = lengths.cumsum(0, dtype=torch.int32)
+        compressed_base = ends - lengths
+        swa_base = total + self.swa_offsets[:-1]
+        # output_size is known on the host, so repeat_interleave does not need
+        # to synchronize the device to determine its output allocation.
+        request_ids = torch.repeat_interleave(
+            torch.arange(self.num_reqs, device=device), lengths, output_size=total
+        )
+        positions = torch.arange(total, device=device) - compressed_base[request_ids]
+        return compressed_base, swa_base, request_ids, positions
 
     def layer_inputs(
         self,
@@ -317,10 +333,16 @@ class SparsePrefillChunkCache:
         per_req_c128 = c128_page_indices.narrow(1, 0, c128_max).index_select(
             0, last_q_per_req
         )
+        # One slot even for a request shorter than a block, as c128_max keeps.
+        lengths_cpu = [max(n, 1) for n in self._compressed_lengths_cpu(128)]
+        compressed_base, swa_base, request_ids, positions = self._packed_layout(
+            lengths_cpu
+        )
         # Clamp -1 -> 0 so dequant doesn't OOB; combine masks the invalid
         # tail via topk_len.
-        flat_c128_ids = per_req_c128.reshape(-1).clamp_min(0).to(torch.int32)
-        compressed_base, swa_base = self._workspace_bases(c128_max)
+        flat_c128_ids = (
+            per_req_c128[request_ids, positions].clamp_min(0).to(torch.int32)
+        )
         # Pre-compute the c128 combine output. topk_indices[q, j] = j is the
         # arange-broadcast pattern; we materialize it once here so the
         # combine kernel can read it like any other topk tensor.
@@ -368,7 +390,6 @@ class SparsePrefillChunkCache:
         gather = self.compressed.get(compress_ratio)
         if gather is not None:
             return gather
-        device = self.seq_lens.device
         c_max = max(self.max_seq_len // compress_ratio, 1)
         c_capacity = page_table.shape[-1] * c_page_size
         assert c_max <= c_capacity, (
@@ -377,28 +398,8 @@ class SparsePrefillChunkCache:
         first_q_per_req = (
             self.query_start_loc[:-1].clamp_max(self.num_qo_tokens - 1).long()
         )
-        # Each request needs only its own live compressed history. Keeping a
-        # rectangular [num_reqs, c_max] gather duplicates the longest extent
-        # for every short request in a mixed batch.
-        seq_lens_cpu = self.seq_lens_cpu
-        if seq_lens_cpu is None:
-            seq_lens_cpu = self.seq_lens.tolist()
-        lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
-        total_compressed = sum(lengths_cpu)
-        lengths = async_h2d(lengths_cpu, dtype=torch.int32, device=device)
-        ends = lengths.cumsum(0, dtype=torch.int32)
-        compressed_base = ends - lengths
-        swa_base = total_compressed + self.swa_offsets[:-1]
-
-        # output_size is known on the host, so repeat_interleave does not need
-        # to synchronize the device to determine its output allocation.
-        request_ids = torch.repeat_interleave(
-            torch.arange(self.num_reqs, device=device),
-            lengths,
-            output_size=total_compressed,
-        )
-        positions = (
-            torch.arange(total_compressed, device=device) - compressed_base[request_ids]
+        compressed_base, swa_base, request_ids, positions = self._packed_layout(
+            self._compressed_lengths_cpu(compress_ratio)
         )
         pages = page_table[first_q_per_req[request_ids], positions // c_page_size]
         flat_ids = (pages * c_page_size + positions % c_page_size).to(torch.int32)
